@@ -119,16 +119,16 @@ class AFM(nn.Module):
             start += 1
 
          # 选择使用AFM层或普通FM,True:AFM,False:FM
-        self.use_attention = use_attention
+        self.use_attention = True
         if self.use_attention:
-            self.fm = AFMLayer(embedding_size, attention_factor, l2_reg, drop_rate)
+            self.fm = AFMLayer(embedding_size, attention_factor, l2_reg, drop_rate=0.9)
         else:
             self.fm = FM()
 
         # 线性部分（全连接层）
         dnn_hidden_units = [len(feat_size), 1]                      # 输入维度为特征数，输出1维
         self.linear = nn.ModuleList([
-            nn.Linear(dnn_hidden_units[i], dnn_hidden_units[i + 1]) for i in range(len(dnn_hidden_units) - 1)
+            nn.Linear(len(feat_size), 1)
         ])
         # 初始化线性层权重
         for name, tensor in self.linear.named_parameters():
@@ -163,19 +163,20 @@ class AFM(nn.Module):
 
 if __name__ == '__main__':
 
-    batch_size = 1024
-    lr = 1e-3
+    torch.cuda.empty_cache()  # 训练开始前执行
+    batch_size = 2048
+    lr = 1e-4
     wd = 0
     epoches = 100
     seed = 2022
-    embedding_size = 4
-    device = 'cpu' # device = 'cuda:0'
+    embedding_size = 8
+    device = 'cuda:0' # device = 'cuda:0'
 
     # 定义特征列
     sparse_feature = ['C' + str(i) for i in range(1, 27)]               # 26个稀疏特征（类别型）
     dense_feature = ['I' + str(i) for i in range(1, 14)]                # 13个密集特征（数值型）
     col_names = ['label'] + dense_feature + sparse_feature
-    data = pd.read_csv('D:/al_random/MAGA/pytorch_AFM/dac_sample.txt', names=col_names, sep='\t')
+    data = pd.read_csv('/root/yesy/MAGA/pytorch/train_sam.txt', names=col_names, sep='\t')  #100w数据集来自https://www.kaggle.com/datasets/shengyaoye/maga-paperdatast/data
 
     data[sparse_feature] = data[sparse_feature].fillna('-1', )          # 稀疏特征填充-1
     data[dense_feature] = data[dense_feature].fillna('0',)              # 密集特征填充0
@@ -206,7 +207,7 @@ if __name__ == '__main__':
 
     train, test = train_test_split(data, test_size=0.2, random_state=seed)
 
-    device = 'cpu'   # device = 'cuda:0'
+    device = 'cuda:0'   # device = 'cuda:0'
     model = AFM(feat_sizes, embedding_size, dnn_feature_columns, use_attention=True).to(device)
 
     train_label = pd.DataFrame(train['label'])
