@@ -1,0 +1,179 @@
+随机算法推荐结果按ctr降序
+
+kldj行为表：
+
+ctr计算：item_sql修改,bhv中的play/(expose+play)，需要sql聚合
+
+huaxia_0da9efb6c7d2cdd4,10246601,gxxt_6e61382dbf122e61,aqy_3b7845c3fe03eac3,aqy_c3f1f13359f458ab,sh_3aaac1cad777ac9d,bpys_e961e0c73e0ced46,dm_94fe88be158caaa8
+问题及解决：
+查询时间过长，十几分钟
+1.分区：p_dt进行分区，这是hive表里的分区列（虚拟，存在于目录中，查询时会只扫描分区提高效率）
+
+
+上线usercf：
+原理：
+user-item表（用户对物品的评分，{"user1":{item1, item2,...}）——>建立item-user倒排表（python的dict嵌套实现，其实是u-i倒一下）
+——>建立物品用户交集矩阵（基于i-u，sim表示用户u与v共同喜欢的物品数(nu∩nv)/sqrt（nu*nv））
+
+问题：
+运行时间过长8h，添加时间，来分区扫描也无效（spark执行作业步骤所花时间长）导致很难debug
+0.97**date_diff不存在
+计算余弦相似度分母为0
+
+解决：
+跑两天数据（分区）
+利用bhv_value作取对数——>归一化——>非线性压索（开根号，减小差距）——>范围调整（*0.97）
+计算cos时分母+1e-9避免为0
+
+思考：
+源代码把0.97**date_diff作为score，而我用bhv_value操作作为score，multi_score为（u1,i1,score1与u2,i1,score2两分数乘积）聚合后建立{u-i}，计算所有对(userA,userB,multi_score)
+——>计算余弦相似度sim（ 分子：用户uv共同物品得分乘积和，分母：用户u,v自身物品得分平方和开根号乘积；同原理，但是分数）
+为了节约开销，broadcast分母方便调用
+
+
+基于物品的协同过滤
+
+参考usercf，原先(u1,i1,score1)(u2,i1,score2)-->(u1,u2,multi_score)转为(u1,i1,score1)(u1,i2,score2)-->(i1,i2,multi_score)
+原先按用户聚合，计算sum_score转为按物品聚合；每个用户喜欢的topn物品（这段不用改动）
+
+热门时间衰减CTR
+
+原理：
+利用cur_date与publish_time的差date_diff对历史行为应用指数衰减0.9^diff
+历史行为包括点击数和曝光数。最终ctr=(加权点击数/(加权曝光数+1)),（+1为拉普拉斯平滑，避免除0）
+
+思考：
+logging.info(xxx.count())会触发spark作业执行，花费许多时间，可仅在本地调试时执行；相关注释后，花销2000s-1500s
+------
+原理详解
+在 Spark 中，data_df.count() 触发作业执行的根本原因是 Spark 的惰性执行机制（Lazy Evaluation）。以下是详细解释：
+
+1. 惰性执行机制
+Spark 的转换操作（如 map, filter, join）不会立即执行，而是记录操作逻辑并生成一个 执行计划（DAG，有向无环图）。只有当遇到 行动操作（如 count(), show(), collect()） 时，Spark 才会根据 DAG 触发实际计算。
+示例：
+df = spark.read.csv("data.csv")  # 惰性操作，仅记录元数据
+df_filtered = df.filter(df.age > 30)  # 惰性操作，生成执行计划
+df_filtered.count()  # 行动操作，触发实际计算
+
+2. count() 的作用
+行为：统计 DataFrame 的总行数。
+执行流程：
+解析执行计划：从数据源开始，依次执行所有记录的转换操作（如过滤、聚合）。
+全量数据扫描：需要读取所有分区的数据并进行计数汇总。
+网络传输：若数据分布在多个节点，需将各分区的计数结果汇总到 Driver 端。
+耗时原因：
+数据量大时，全量扫描和网络传输会显著增加延迟。
+复杂的转换操作（如多表关联）会生成多阶段任务，进一步增加计算时间。
+
+3. 为何建议仅在调试时启用 count()
+生产环境风险：
+资源消耗：全量数据扫描占用集群 CPU、内存和 I/O 资源。
+稳定性问题：大表 count() 可能触发 OOM（内存溢出）或任务超时。
+调试场景：
+验证数据正确性：例如检查过滤后数据量是否符合预期。
+抽样检查：结合 show(10) 快速验证数据格式。
+
+4. 替代方案与优化
+缓存加速：若需多次调用 count()，先持久化数据：
+data_df.persist()  # 缓存到内存/磁盘
+data_df.count()    # 首次计算并缓存
+data_df.count()    # 后续直接读取缓存，避免重复计算
+近似统计：用 approx_count_distinct 快速估算行数（误差率可控）：
+from pyspark.sql.functions import approx_count_distinct
+data_df.agg(approx_count_distinct("*").alias("approx_count")).show()
+分区统计：直接读取元数据（仅限分区表）：
+spark.sql("SHOW PARTITIONS table").show()  # 查看分区数
+
+
+基于ALS交替最小二乘每隔1h离线计算召回
+
+问题：ALS不支持增量训练，但利用（时间）滑动窗口获取数据来训练模拟增量效果，但需保存之前模型长时间会导致内存、计算资源不足
+
+7天内试探偏好
+偏好计算:根据用户近7天历史观看>10min的剧，按
+分类值计数，统计其数量，按数量正序取top5为其偏好
+							0.4ctr+0.6人均时长
+							(ctr和时长归一处理)
+召回:召回前top5分类下，人均时长排序top3的内容			(5*3)(有几个标签取几个标签)
+去重:召回进行去重
+
+step1:
+self.df：[cur_time-7,cur_time]取用户行为数据，bhv_time转int存为duration_ms
+
+step2：
+计算基础指标：按item_id聚合，计算play_count,expose_count,click_count,total_duration_ms；过滤历史观看<10min的item
+
+step3：
+计算ctr与平均观看时长
+
+step4：
+分别对ctr与total_duration_ms归一化，计算加权pvctr；存到self.user_behavior_df
+
+step5：
+正则分割处理物料表的category_path，并explode展开；存到self.item_category_df
+
+step6：
+self.item_category_df按category聚合，collect_set()，再展开成category与item的映射（一对多）；left_join self.user_behavior_df
+
+step7：
+按 category 统计总播放次数，降序取Top5
+为每个 Top5 category 返回人均时长 Top3 的 item_id：筛选属于 Top5 分类的数据，并按 avg_duration 排序
+添加排名并过滤 Top3
+
+done!
+
+正则化分割item的category_path并explode（spark2.无对应函数，explode为了构建表）
+ctr与abg分开归一化
+播放时长>=10min：需要先汇总再计算总播放时长（很少有单个视频单次播放达到如此时长）
+需对item_category按item_id聚合再let_join user_behavior，避免信息消失（user..按item_id聚合，使user_id无）
+
+
+
++--------+--------------------+------------------+
+	|category|             item_id|      avg_duration|
+	+--------+--------------------+------------------+
+[INFO] 2025-03-12 15:09:21.665  - [taskAppId=TASK-339448-44686530-96419121]:[110] -  -> |    现代言情|zhy_503a3ab80fb8c07b| 116769.4423174657|
+	|    现代言情|sjcm_9b00c678de43...|107578.16666666667|
+	|    现代言情| cy_60a8b3ed702d4961|101882.09589041096|
+	|    悬疑推理|huaxia_0da9efb6c7...|32363.534246575342|
+	|    悬疑推理|aqy_9abd485cafa51a1f|              null|
+	|    悬疑推理|aqy_097ccd952abd4d0d|              null|
+	|      王妃|aqy_9f24dceefe8785d7| 88949.14615384616|
+	|      王妃| jd_eaebdfa7c073754c| 86843.45368620037|
+	|      王妃|aqy_eded13d621f71a3e| 80559.79831932773|
+	|      都市|aqy_7e49b656943cd525|       120235.9375|
+	|      都市|aqy_cd3d9171c62d5a24|110595.14583333333|
+	|      都市|aqy_85f16636e3a459da|107304.80138568129|
+	|      爽剧|aqy_cd3d9171c62d5a24|110595.14583333333|
+	|      爽剧|aqy_85f16636e3a459da|107304.80138568129|
+	|      爽剧| bw_4c49b384bb5f912d|  98205.2259414226|
+	|      总裁|zhy_503a3ab80fb8c07b| 116769.4423174657|
+	|      总裁| cy_60a8b3ed702d4961|101882.09589041096|
+	|      总裁| ww_ea29683ff8778e5a| 95805.49410377358|
+	|      古装|qsyy_a8f417f5ef75...|              null|
+	|      古装|nah_646affe9a309300c|              null|
+	+--------+--------------------+------------------+
+
++--------------------+--------------------+
+	|             user_id|     top5_categories|
+	+--------------------+--------------------+
+	|01c5ec93e3ea96670...|[总裁, 都市, 现代言情, 爽剧...|
+	|    3d617decdcc8f6f3|[都市, 逆袭, 爽剧, 现代言情...|
+	|5dee242afd5ddbf0a...|[现代言情, 总裁, 甜宠, 萌宝...|
+	|A393877F1D874E71B...|[现代言情, 总裁, 甜宠, 家庭...|
+	|CE1E44B1-CFB30977...|[现代言情, 总裁, 逆袭, 搞笑...|
+	|bfc29a218505b675d...|[都市, 甜宠, 总裁, 爽剧, ...|
+	|c1e6e93e3dbde1cda...|[都市, 现代言情, 总裁, 爽剧...|
+	|c7d782ea-1a0f-4c6...|[逆袭, 女强, 爽剧, 都市, ...|
+	|e7e8fb0b-d7df-4b2...|[现代言情, 总裁, 甜宠, 虐恋...|
+	|f7510eb1-140f-4d8...|[现代言情, 总裁, 甜宠, 都市...|
+	|04cbb3902065d1477...|[现代言情, 总裁, 爽剧, 都市...|
+	|3b324b32990e75952...|[爽剧, 战神, 高手下山, 逆袭...|
+	|8042969378f5514cc...|[现代言情, 逆袭, 爽剧, 总裁...|
+	|840C92B4-14AA-468...|[总裁, 现代言情, 都市, 爽剧...|
+	|    8fd5c8ac6685123b|[逆袭, 现代言情, 总裁, 家庭...|
+	|974eaff5-cea0-4b6...|[爽剧, 都市, 总裁, 现代言情...|
+	|AFAEE1A5A50C4F319...|[现代言情, 总裁, 甜宠, 都市...|
+	|af5898055396a53b2...|[现代言情, 萌宝, 女强, 逆袭...|
+	|    b683449474d7bfbd|[都市, 战神, 现代言情, 总裁...|
+	|    cca554149492d05c|[爽剧, 都市, 现代言情, 总裁...|
